@@ -1,1 +1,0 @@
-{"name":"your-express-app","version":"1.0.0","type":"module","main":"src/index.ts","scripts":{"start":"node src/index.ts", "dev": "tsx watch src/index.ts"},"dependencies":{"express":"^5.2.1","mysql2":"^3.24.4"},"devDependencies":{"tsx":"^4.23.15"}}
