@@ -1,5 +1,4 @@
 import express, { Request, Response } from 'express';
-import { v4 as uuidv4 } from 'uuid';
 import { pool } from './config/db';
 import { db } from './config/firebase';
 import * as admin from 'firebase-admin';
@@ -11,7 +10,7 @@ const app = express();
 app.use(express.json());
 
 // ==========================================
-// 1. Create or Get Chat
+// 1. Create or Get Chat / Initialize Chat
 // ==========================================
 app.post('/chat/create', async (req: Request, res: Response): Promise<any> => {
     try {
@@ -20,11 +19,12 @@ app.post('/chat/create', async (req: Request, res: Response): Promise<any> => {
             return res.status(400).json({ error: 'userAId and userBId are required' });
         }
 
-        // Check if chat already exists between userAId and userBId in either direction
+        // Check if a conversation already exists between userAId and userBId
         const [rows]: [any[], any] = await pool.query(
             `SELECT id FROM chats 
-             WHERE (user_a_id = ? AND user_b_id = ?) 
-                OR (user_a_id = ? AND user_b_id = ?)`,
+             WHERE (sender_user_id = ? AND receiver_user_id = ?) 
+                OR (sender_user_id = ? AND receiver_user_id = ?) 
+             LIMIT 1`,
             [userAId, userBId, userBId, userAId]
         );
 
@@ -32,14 +32,13 @@ app.post('/chat/create', async (req: Request, res: Response): Promise<any> => {
             return res.status(200).json({ chatId: rows[0].id });
         }
 
-        // Create new chat
-        const chatId = uuidv4();
-        await pool.query(
-            `INSERT INTO chats (id, user_a_id, user_b_id) VALUES (?, ?, ?)`,
-            [chatId, userAId, userBId]
+        // Insert initial connection/chat record
+        const [result]: [any, any] = await pool.query(
+            `INSERT INTO chats (sender_user_id, receiver_user_id, chat_message, chat_type) VALUES (?, ?, ?, ?)`,
+            [userAId, userBId, 'Chat initialized', 'one-to-one']
         );
 
-        return res.status(201).json({ chatId });
+        return res.status(201).json({ chatId: result.insertId });
     } catch (error: any) {
         console.error('Error in /chat/create:', error);
         return res.status(500).json({ error: 'Internal Server Error' });
@@ -47,30 +46,27 @@ app.post('/chat/create', async (req: Request, res: Response): Promise<any> => {
 });
 
 // ==========================================
-// 2. Send Message
+// 2. Send Message (Stored in MySQL matching schema)
 // ==========================================
 app.post('/chat/:chatId/message/send', async (req: Request, res: Response): Promise<any> => {
     try {
         const { chatId } = req.params;
-        const { senderId, text } = req.body;
+        const { senderId, receiverId, text, chatType } = req.body;
 
-        if (!senderId || !text) {
-            return res.status(400).json({ error: 'senderId and text are required' });
+        if (!senderId || !receiverId || !text) {
+            return res.status(400).json({ error: 'senderId, receiverId, and text are required' });
         }
 
-        const messageRef = db.collection('chats').doc(chatId).collection('messages').doc();
-        const messageData = {
-            id: messageRef.id,
-            senderId,
-            text,
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
-        };
-
-        await messageRef.set(messageData);
+        const [result]: [any, any] = await pool.query(
+            `INSERT INTO chats (sender_user_id, receiver_user_id, chat_message, chat_type) VALUES (?, ?, ?, ?)`,
+            [senderId, receiverId, text, chatType || 'one-to-one']
+        );
 
         return res.status(201).json({ 
-            messageId: messageRef.id, 
+            messageId: result.insertId, 
+            chatId,
             senderId, 
+            receiverId,
             text, 
             timestamp: new Date().toISOString() 
         });
@@ -88,21 +84,23 @@ app.get('/chat/:chatId/messages', async (req: Request, res: Response): Promise<a
         const { chatId } = req.params;
         const limit = parseInt(req.query.limit as string) || 50;
 
-        const messagesSnapshot = await db
-            .collection('chats')
-            .doc(chatId)
-            .collection('messages')
-            .orderBy('timestamp', 'asc')
-            .limit(limit)
-            .get();
+        const [rows]: [any[], any] = await pool.query(
+            `SELECT id, sender_user_id, receiver_user_id, chat_message, chat_type, created_at 
+             FROM chats 
+             WHERE id >= ? 
+             ORDER BY created_at ASC 
+             LIMIT ?`,
+            [chatId, limit]
+        );
 
-        const messages = messagesSnapshot.docs.map(doc => {
-            const data = doc.data();
-            return {
-                ...data,
-                timestamp: data.timestamp ? data.timestamp.toDate() : null
-            };
-        });
+        const messages = rows.map(row => ({
+            messageId: row.id,
+            senderId: row.sender_user_id,
+            receiverId: row.receiver_user_id,
+            text: row.chat_message,
+            chatType: row.chat_type,
+            timestamp: row.created_at
+        }));
 
         return res.status(200).json({ messages });
     } catch (error: any) {
@@ -112,7 +110,7 @@ app.get('/chat/:chatId/messages', async (req: Request, res: Response): Promise<a
 });
 
 // ==========================================
-// 4. Mark Message Read
+// 4. Mark Message Read (Firebase Firestore)
 // ==========================================
 app.post('/chat/:chatId/message/:messageId/read', async (req: Request, res: Response): Promise<any> => {
     try {
@@ -143,7 +141,7 @@ app.post('/chat/:chatId/message/:messageId/read', async (req: Request, res: Resp
 });
 
 // ==========================================
-// 5. Update Last Seen Message
+// 5. Update Last Seen Message (Firebase Firestore)
 // ==========================================
 app.post('/chat/:chatId/lastseen', async (req: Request, res: Response): Promise<any> => {
     try {
@@ -181,15 +179,18 @@ app.get('/user/:userId/chats', async (req: Request, res: Response): Promise<any>
         const { userId } = req.params;
 
         const [rows]: [any[], any] = await pool.query(
-            `SELECT id, user_a_id, user_b_id, created_at 
+            `SELECT id, sender_user_id, receiver_user_id, chat_message, chat_type, created_at 
              FROM chats 
-             WHERE user_a_id = ? OR user_b_id = ?`,
+             WHERE sender_user_id = ? OR receiver_user_id = ?`,
             [userId, userId]
         );
 
         const chats = rows.map(row => ({
             chatId: row.id,
-            members: [row.user_a_id, row.user_b_id],
+            senderId: row.sender_user_id,
+            receiverId: row.receiver_user_id,
+            message: row.chat_message,
+            chatType: row.chat_type,
             createdAt: row.created_at
         }));
 
